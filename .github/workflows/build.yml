@@ -1,0 +1,315 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate project files
+        run: |
+          mkdir -p "$(dirname 'build.gradle')"
+          cat > 'build.gradle' <<'SMOOTHEOF'
+          plugins {
+          	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+          	id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+          	archivesName = project.archives_base_name
+          }
+
+          dependencies {
+          	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+          	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+          }
+
+          processResources {
+          	inputs.property "version", project.version
+
+          	filesMatching("fabric.mod.json") {
+          		expand "version": inputs.properties.version
+          	}
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+          	it.options.encoding = "UTF-8"
+          	it.options.release = 25
+          }
+
+          java {
+          	sourceCompatibility = JavaVersion.VERSION_25
+          	targetCompatibility = JavaVersion.VERSION_25
+          }
+          SMOOTHEOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'SMOOTHEOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          org.gradle.configuration-cache=false
+
+          # Fabric Properties (see https://fabricmc.net/develop and https://fabricmc.net/2026/09/15/263.html)
+          minecraft_version=26.3
+          loader_version=0.19.5
+          loom_version=1.17-SNAPSHOT
+
+          # Mod Properties
+          mod_version=1.0.0
+          maven_group=dev.smoothlook
+          archives_base_name=smoothlook
+          SMOOTHEOF
+          mkdir -p "$(dirname 'settings.gradle')"
+          cat > 'settings.gradle' <<'SMOOTHEOF'
+          pluginManagement {
+          	repositories {
+          		maven {
+          			name = 'Fabric'
+          			url = 'https://maven.fabricmc.net/'
+          		}
+          		mavenCentral()
+          		gradlePluginPortal()
+          	}
+          }
+
+          rootProject.name = 'smoothlook'
+          SMOOTHEOF
+          mkdir -p "$(dirname 'src/main/java/dev/smoothlook/SmoothLook.java')"
+          cat > 'src/main/java/dev/smoothlook/SmoothLook.java' <<'SMOOTHEOF'
+          package dev.smoothlook;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.lang.ref.WeakReference;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.nio.file.attribute.FileTime;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.player.LocalPlayer;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          /**
+           * Smoothing core. Works purely with input DELTAS (mouse movement units), never with absolute angles,
+           * so there is no 180/-180 wrap-around problem and no drift: every unit of input is applied exactly once
+           * (the buffer only moves input in time, it never creates or destroys any, except pitch input that would
+           * push beyond the +-90 degree limit, which is discarded just like vanilla discards it).
+           *
+           * Everything here runs on the client main thread only.
+           */
+          public final class SmoothLook {
+          	private static final Logger LOGGER = LoggerFactory.getLogger("smoothlook");
+          	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+          	private static final Path CONFIG_PATH = FabricLoader.getInstance().getConfigDir().resolve("smoothlook.json");
+
+          	/** Time constant in seconds at smoothing = 100. */
+          	private static final double MAX_TAU_SECONDS = 0.20;
+          	/** Below this many mouse units the remaining buffer is flushed at once. */
+          	private static final double FLUSH_EPSILON = 0.05;
+
+          	public static final class Config {
+          		public boolean enabled = true;
+          		/** 0 = off (vanilla), 100 = strongest lag. */
+          		public int smoothing = 35;
+          	}
+
+          	private static volatile Config config = new Config();
+          	private static FileTime lastModified;
+          	private static long lastConfigCheckNs = Long.MIN_VALUE;
+          	private static boolean configErrorLogged;
+
+          	private static WeakReference<LocalPlayer> lastPlayer = new WeakReference<>(null);
+          	private static long lastNs;
+          	private static double pendingYaw;
+          	private static double pendingPitch;
+
+          	/** Output of prepare(): what to hand to the vanilla LocalPlayer.turn call this frame. */
+          	public static double outYaw;
+          	public static double outPitch;
+
+          	private SmoothLook() {}
+
+          	public static void prepare(LocalPlayer player, double yaw, double pitch) {
+          		long now = System.nanoTime();
+          		reloadConfigIfChanged(now);
+
+          		if (lastPlayer.get() != player) {
+          			lastPlayer = new WeakReference<>(player);
+          			pendingYaw = 0;
+          			pendingPitch = 0;
+          			lastNs = now;
+          		}
+
+          		double dt = Math.min((now - lastNs) / 1.0e9, 0.1);
+          		lastNs = now;
+
+          		pendingYaw += yaw;
+          		pendingPitch += pitch;
+
+          		Config c = config;
+          		if (!c.enabled || c.smoothing <= 0) {
+          			outYaw = pendingYaw;
+          			outPitch = pendingPitch;
+          			pendingYaw = 0;
+          			pendingPitch = 0;
+          			return;
+          		}
+
+          		double tau = (c.smoothing / 100.0) * MAX_TAU_SECONDS;
+          		double alpha = 1.0 - Math.exp(-dt / tau); // frame-rate independent catch-up fraction
+
+          		double applyYaw = pendingYaw * alpha;
+          		double applyPitch = pendingPitch * alpha;
+          		pendingYaw -= applyYaw;
+          		pendingPitch -= applyPitch;
+
+          		if (Math.abs(pendingYaw) < FLUSH_EPSILON) {
+          			applyYaw += pendingYaw;
+          			pendingYaw = 0;
+          		}
+          		if (Math.abs(pendingPitch) < FLUSH_EPSILON) {
+          			applyPitch += pendingPitch;
+          			pendingPitch = 0;
+          		}
+
+          		outYaw = applyYaw;
+          		outPitch = applyPitch;
+          	}
+
+          	/** Called after vanilla applied our delta. If pitch was clamped at +-90 deg, drop the buffered pitch so it can't "wind up". */
+          	public static void finish(float actualPitchChange) {
+          		if (Math.abs(outPitch) > FLUSH_EPSILON && Math.abs(actualPitchChange) < 1.0e-6f) {
+          			pendingPitch = 0;
+          		}
+          	}
+
+          	private static void reloadConfigIfChanged(long nowNs) {
+          		if (lastConfigCheckNs != Long.MIN_VALUE && nowNs - lastConfigCheckNs < 1_000_000_000L) {
+          			return;
+          		}
+          		lastConfigCheckNs = nowNs;
+          		try {
+          			if (!Files.exists(CONFIG_PATH)) {
+          				Files.createDirectories(CONFIG_PATH.getParent());
+          				Files.writeString(CONFIG_PATH, GSON.toJson(new Config()));
+          			}
+          			FileTime modified = Files.getLastModifiedTime(CONFIG_PATH);
+          			if (modified.equals(lastModified)) {
+          				return;
+          			}
+          			lastModified = modified;
+          			try (Reader reader = Files.newBufferedReader(CONFIG_PATH)) {
+          				Config loaded = GSON.fromJson(reader, Config.class);
+          				if (loaded != null) {
+          					loaded.smoothing = Math.max(0, Math.min(100, loaded.smoothing));
+          					config = loaded;
+          					LOGGER.info("Config loaded: enabled={}, smoothing={}", loaded.enabled, loaded.smoothing);
+          				}
+          			}
+          		} catch (IOException | RuntimeException e) {
+          			if (!configErrorLogged) {
+          				configErrorLogged = true;
+          				LOGGER.warn("Could not read {} - using current settings", CONFIG_PATH, e);
+          			}
+          		}
+          	}
+          }
+          SMOOTHEOF
+          mkdir -p "$(dirname 'src/main/java/dev/smoothlook/mixin/MouseHandlerMixin.java')"
+          cat > 'src/main/java/dev/smoothlook/mixin/MouseHandlerMixin.java' <<'SMOOTHEOF'
+          package dev.smoothlook.mixin;
+
+          import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+          import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+          import dev.smoothlook.SmoothLook;
+          import net.minecraft.client.MouseHandler;
+          import net.minecraft.client.player.LocalPlayer;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+
+          @Mixin(MouseHandler.class)
+          public abstract class MouseHandlerMixin {
+
+          	/**
+          	 * Vanilla turns the player once per frame inside MouseHandler.turnPlayer via LocalPlayer.turn(yaw, pitch).
+          	 * We wrap that single call: the raw mouse delta goes into a buffer, and only a time-based fraction
+          	 * of the buffer is passed on to the original method. The player's REAL rotation therefore is the camera
+          	 * rotation, so the crosshair / hit-scan never diverges from what you see.
+          	 */
+          	@WrapOperation(
+          		method = "turnPlayer",
+          		at = @At(
+          			value = "INVOKE",
+          			target = "Lnet/minecraft/client/player/LocalPlayer;turn(DD)V"
+          		)
+          	)
+          	private void smoothlook$smoothTurn(LocalPlayer player, double yRot, double xRot, Operation<Void> original) {
+          		SmoothLook.prepare(player, yRot, xRot);
+          		float pitchBefore = player.getXRot();
+          		original.call(player, SmoothLook.outYaw, SmoothLook.outPitch);
+          		SmoothLook.finish(player.getXRot() - pitchBefore);
+          	}
+          }
+          SMOOTHEOF
+          mkdir -p "$(dirname 'src/main/resources/fabric.mod.json')"
+          cat > 'src/main/resources/fabric.mod.json' <<'SMOOTHEOF'
+          {
+            "schemaVersion": 1,
+            "id": "smoothlook",
+            "version": "${version}",
+            "name": "Smooth Look",
+            "description": "Camera lags slightly behind mouse movement and smoothly catches up. Client-side only.",
+            "authors": ["You"],
+            "license": "MIT",
+            "environment": "client",
+            "mixins": ["smoothlook.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.19.5",
+              "minecraft": "~26.3",
+              "java": ">=25"
+            }
+          }
+          SMOOTHEOF
+          mkdir -p "$(dirname 'src/main/resources/smoothlook.mixins.json')"
+          cat > 'src/main/resources/smoothlook.mixins.json' <<'SMOOTHEOF'
+          {
+            "required": true,
+            "minVersion": "0.8",
+            "package": "dev.smoothlook.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "mixins": [],
+            "client": ["MouseHandlerMixin"],
+            "injectors": {
+              "defaultRequire": 1
+            }
+          }
+          SMOOTHEOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.6.0'
+
+      - name: Build
+        run: gradle build --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoothlook-jar
+          path: build/libs/smoothlook-1.0.0.jar
+          if-no-files-found: error
